@@ -1,0 +1,139 @@
+import math
+import random
+from typing import Dict, Optional
+import numpy as np
+
+def boiler_heat_transfer(
+    Q_to_boiler_MJ: float,   # energy available at boiler inlet for the period [MJ]
+    tau_s: float,            # modelling period in seconds (e.g., 3600 for 1 hour)
+    *,
+    # --- Nominal baseline (used for self-calibration only) ---
+    T_hot_in_nom_K: float = 1100.0,     # flue-gas temp entering boiler convective passes [K]
+    T_cold_eff_nom_K: float = 520.0,    # effective cold-side temp (steam/water metal approach) [K]
+    mdot_g_nom_kg_s: float = 20.0,      # gas mass flow [kg/s]
+    cp_g_nom_J_kgK: float = 1150.0,     # flue-gas cp [J/kg-K]
+    UA_boiler_nom_W_K: float = 9000.0,  # overall UA (evaporator + superheater + economiser) [W/K]
+    shell_loss_frac_nom: float = 0.01,  # boiler casing/radiation/blowdown fraction of Q_to_boiler
+
+    # --- Day-to-day variability (volatility drivers) ---
+    T_hot_in_mean_K: float = 1100.0,  T_hot_in_sd_K: float = 70.0,
+    T_cold_eff_mean_K: float = 520.0, T_cold_eff_sd_K: float = 15.0,
+    mdot_g_mean_kg_s: float = 20.0,   mdot_g_sd_kg_s: float = 3.0,
+    cp_g_mean_J_kgK: float = 1150.0,  cp_g_sd_J_kgK: float = 60.0,
+
+    # Fouling/soot/ventilation → lognormal UA multiplier
+    UA_logn_mu: float = 0.0, UA_logn_sigma: float = 0.30, UA_cap_mult: float = 2.5,
+
+    # Shell & blowdown loss fraction (small, but variable)
+    shell_loss_frac_mean: float = 0.010, shell_loss_frac_sd: float = 0.004,
+
+    # Target mean absorbed fraction (≈ boiler efficiency relative to Q_to_boiler)
+    target_absorb_frac: float = 0.85,
+
+    rng: Optional[random.Random] = None,
+) -> Dict[str, float]:
+    """
+    Corrected Process 4: Boiler heat-transfer with robust calibration.
+    Returns dict containing steam_energy_MJ, absorb_frac, stack_energy_MJ, shell_loss_MJ, alpha_cal, samples...
+    """
+    rng = rng or random.Random()
+
+    def _clip(x, lo, hi): return max(lo, min(hi, x))
+
+    # ---------- 1) Nominal baseline (for self-calibration) ----------
+    C_hot_nom = mdot_g_nom_kg_s * cp_g_nom_J_kgK               # [W/K]
+    NTU_nom   = UA_boiler_nom_W_K / max(1e-9, C_hot_nom)
+    eps_nom   = 1.0 - math.exp(-NTU_nom)                       # heat-exchanger effectiveness
+    dT_nom    = max(0.0, T_hot_in_nom_K - T_cold_eff_nom_K)
+    Qdot_abs_nom_W = eps_nom * C_hot_nom * dT_nom              # absorbed by water/steam side [W]
+    Q_abs_nom_MJ = Qdot_abs_nom_W * tau_s / 1e6
+
+    # Nominal shell/blowdown loss (fraction of Q_to_boiler)
+    shell_loss_nom_MJ = shell_loss_frac_nom * Q_to_boiler_MJ
+
+    # ---- NEW calibration (robust) ----
+    # Solve alpha so that: alpha * Q_abs_nom_MJ - shell_loss_nom_MJ = target_absorb_frac * Q_to_boiler_MJ
+    if Q_abs_nom_MJ <= 1e-12:
+        alpha = 1.0
+    else:
+        alpha = (target_absorb_frac * Q_to_boiler_MJ + shell_loss_nom_MJ) / Q_abs_nom_MJ
+
+    # ---------- 2) Randomised day-to-day sample ----------
+    T_hot_in_K   = _clip(rng.normalvariate(T_hot_in_mean_K,  T_hot_in_sd_K),  850.0, 1300.0)
+    T_cold_eff_K = _clip(rng.normalvariate(T_cold_eff_mean_K, T_cold_eff_sd_K), 480.0, 560.0)
+    mdot_g       = _clip(rng.normalvariate(mdot_g_mean_kg_s, mdot_g_sd_kg_s), 6.0, 60.0)
+    cp_g         = _clip(rng.normalvariate(cp_g_mean_J_kgK,  cp_g_sd_J_kgK),  900.0, 1400.0)
+
+    UA_mult      = min(math.exp(rng.normalvariate(UA_logn_mu, UA_logn_sigma)), UA_cap_mult)
+    UA_boiler    = UA_boiler_nom_W_K * UA_mult
+
+    shell_loss_frac = _clip(rng.normalvariate(shell_loss_frac_mean, shell_loss_frac_sd), 0.002, 0.03)
+
+    # ---------- 3) Physics calc for this draw ----------
+    C_hot  = mdot_g * cp_g                                   # [W/K]
+    NTU    = UA_boiler / max(1e-9, C_hot)
+    eps    = 1.0 - math.exp(-NTU)
+    dT     = max(0.0, T_hot_in_K - T_cold_eff_K)
+
+    Qdot_abs_W = eps * C_hot * dT                            # [W]
+    Q_abs_MJ   = Qdot_abs_W * tau_s / 1e6
+    shell_loss_MJ = shell_loss_frac * Q_to_boiler_MJ
+
+    # Apply calibration then clamp to available energy minus shell loss
+    useful_raw_MJ = alpha * Q_abs_MJ - shell_loss_MJ
+    useful_abs_MJ = max(0.0, min(Q_to_boiler_MJ - shell_loss_MJ, useful_raw_MJ))
+
+    # Energy bookkeeping
+    steam_energy_MJ  = useful_abs_MJ                                   # to steam circuit
+    stack_energy_MJ  = max(0.0, Q_to_boiler_MJ - steam_energy_MJ - shell_loss_MJ)
+
+    absorb_frac = steam_energy_MJ / Q_to_boiler_MJ if Q_to_boiler_MJ > 0 else 0.0
+
+    return {
+        "steam_energy_MJ": steam_energy_MJ,
+        "absorb_frac": absorb_frac,          # ≈ target_absorb_frac on average now
+        "stack_energy_MJ": stack_energy_MJ,  # unabsorbed → goes to stack
+        "shell_loss_MJ": shell_loss_MJ,      # boiler casing/blowdown loss
+        "alpha_cal": alpha,
+        # Traceability of samples
+        "samples_T_hot_in_K": T_hot_in_K,
+        "samples_T_cold_eff_K": T_cold_eff_K,
+        "samples_mdot_g_kg_s": mdot_g,
+        "samples_cp_g_J_kgK": cp_g,
+        "samples_UA_boiler_W_K": UA_boiler,
+        "samples_UA_mult": UA_mult,
+        "samples_shell_loss_frac": shell_loss_frac,
+        "samples_eps": eps,
+        "samples_NTU": NTU,
+        "samples_dT_K": dT,
+    }
+
+
+def boiler_heat_transfer_batch(Q_to_boiler_MJ_array, tau_s=3600, *, seed=None, **kwargs):
+    """
+    Batch wrapper: run boiler_heat_transfer(...) over an array of Q_to_boiler values.
+    Returns a dict of NumPy arrays (same keys as boiler_heat_transfer).
+    """
+    rng = random.Random(seed)
+    q = np.asarray(Q_to_boiler_MJ_array, dtype=float)
+
+    outs = [boiler_heat_transfer(float(Q), tau_s, rng=rng, **kwargs) for Q in q]
+
+    if len(outs) == 0:
+        return {}
+
+    keys = list(outs[0].keys())
+    return {k: np.array([o[k] for o in outs]) for k in keys}
+
+
+# --- Example ---
+# Q_to_boiler_hourly = np.full(24, 50000.0)   # MJ per hour (example)
+# res4 = boiler_heat_transfer_batch(Q_to_boiler_hourly, tau_s=3600, seed=123)
+# print(res4["absorb_frac"].mean())  # should now be ≈ 0.85 (depending on inputs)
+
+# Suppose Q_to_boiler_hourly is a numpy array of 24 hourly MJ values
+res4 = boiler_heat_transfer_batch(E_postflue, tau_s=3600, seed=123)
+
+E_postboiler=(res4["absorb_frac"])*E_postflue
+
+print(E_postboiler)
