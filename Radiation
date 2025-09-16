@@ -1,0 +1,189 @@
+import math
+import random
+from typing import Dict, Tuple, List, Optional
+
+SIGMA = 5.670374419e-8  # Stefan–Boltzmann [W/m^2/K^4]
+
+def _h_radiation(epsilon: float, T_K: float) -> float:
+    """Linearised radiative heat-transfer coefficient, h_rad ≈ 4 ε σ T^3 [W/m^2/K]."""
+    return 4.0 * epsilon * SIGMA * (T_K**3)
+
+def _clip(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def radiation(
+    Q_chem_MJ: float,
+    tau_s: float,
+    *,
+    # --- Geometry / materials (treat as design constants unless you want to change them) ---
+    A_wall: float = 180.0,                       # m^2 (effective hot-wall area)
+    layers: List[Tuple[float, float]] = ((0.23, 1.5), (0.10, 0.25)),   # (thickness [m], k [W/m/K]) pairs
+    epsilon_in_nom: float = 0.85,                # hot-face emissivity (nominal)
+    # --- Nominal means for calibration baseline ---
+    T_gas_nom_K: float = 1300.0,                 # K (≈ 1027°C)
+    T_amb_nom_K: float = 293.0,                  # K (20°C)
+    h_in_nom: float = 40.0,                      # W/m^2/K (turbulent furnace gas)
+    h_out_nom: float = 8.0,                      # W/m^2/K (natural/weak forced convection outside)
+    A_open_nom_m2: float = 0.003,                # m^2 (tiny net leakage area when closed up)
+    dP_nom_Pa: float = 5.0,                      # Pa (draft)
+    # --- Randomisation controls (day-to-day variability) ---
+    Tg_mean_K: float = 1300.0, Tg_sd_K: float = 80.0,
+    Tamb_mean_K: float = 293.0, Tamb_sd_K: float = 8.0,
+    h_in_mean: float = 40.0, h_in_sd: float = 10.0,
+    h_out_mean: float = 8.0,  h_out_sd: float = 3.0,
+    eps_mean: float = 0.85,   eps_sd: float = 0.03,
+    # lognormal for openings (right-tailed; occasional larger gaps/door checks)
+    Aopen_logn_mu: float = math.log(0.003), Aopen_logn_sigma: float = 0.9, Aopen_cap_m2: float = 0.05,
+    dP_mean_Pa: float = 5.0, dP_sd_Pa: float = 3.0,
+    # Gas properties for leakage enthalpy
+    Cd: float = 0.6, rho_gas: float = 0.6, cp_gas_J_per_kgK: float = 1150.0,
+    # Target calibration
+    target_pct: float = 0.03,
+    rng: Optional[random.Random] = None,
+) -> Dict[str, float]:
+    """
+    Process 3.1: Furnace radiation & conduction losses with day-to-day randomness,
+    calibrated so that the nominal (mean) case ≈ target_pct of Q_chem.
+
+    Parameters
+    ----------
+    Q_chem_MJ : chemical energy released over the period [MJ]
+    tau_s     : modelling period seconds (e.g., 3600 for 1 hour)
+
+    Returns
+    -------
+    dict with:
+      - loss_MJ: calibrated energy lost [MJ] for this call
+      - loss_pct: loss fraction of Q_chem (0..1)
+      - uncal_loss_MJ: raw physics loss before calibration [MJ]
+      - alpha_cal: calibration multiplier applied to hit target mean
+      - samples_*: the randomised inputs used this call
+    """
+    rng = rng or random.Random()
+
+    # ---------------------------
+    # 1) Baseline (nominal) case for self-calibration to target_pct
+    # ---------------------------
+    h_rad_nom = _h_radiation(epsilon_in_nom, T_gas_nom_K)
+    h_in_eff_nom = h_in_nom + h_rad_nom
+    R_cond_nom = sum(L / (k * A_wall) for (L, k) in layers)
+    R_tot_nom = (1.0 / (h_in_eff_nom * A_wall)) + R_cond_nom + (1.0 / (h_out_nom * A_wall))
+    Qdot_wall_nom_W = (T_gas_nom_K - T_amb_nom_K) / R_tot_nom
+
+    # Leakage baseline
+    mdot_nom = Cd * A_open_nom_m2 * math.sqrt(max(0.0, 2.0 * rho_gas * dP_nom_Pa))
+    Qdot_leak_enthalpy_nom_W = mdot_nom * cp_gas_J_per_kgK * (T_gas_nom_K - T_amb_nom_K)
+    h_open_nom = h_in_nom + _h_radiation(epsilon_in_nom, T_gas_nom_K)
+    Qdot_leak_surface_nom_W = h_open_nom * A_open_nom_m2 * (T_gas_nom_K - T_amb_nom_K)
+
+    Qdot_nom_W = Qdot_wall_nom_W + Qdot_leak_enthalpy_nom_W + Qdot_leak_surface_nom_W
+    loss_nom_MJ = Qdot_nom_W * tau_s / 1e6
+    # Calibration factor so baseline equals target_pct * Q_chem
+    alpha = (target_pct * Q_chem_MJ / loss_nom_MJ) if loss_nom_MJ > 0 else 1.0
+
+    # ---------------------------
+    # 2) Randomised day-to-day sample
+    # ---------------------------
+    T_gas_K = rng.normalvariate(Tg_mean_K, Tg_sd_K)
+    T_amb_K = rng.normalvariate(Tamb_mean_K, Tamb_sd_K)
+    T_gas_K = _clip(T_gas_K, 900.0, 1600.0)   # sanity bounds
+    T_amb_K = _clip(T_amb_K, 250.0, 320.0)
+
+    h_in = _clip(rng.normalvariate(h_in_mean, h_in_sd), 10.0, 90.0)
+    h_out = _clip(rng.normalvariate(h_out_mean, h_out_sd), 2.0, 25.0)
+
+    eps_in = _clip(rng.normalvariate(eps_mean, eps_sd), 0.6, 0.95)
+
+    # Lognormal A_open, with cap (rare door-open events still bounded)
+    A_open = min(math.exp(rng.normalvariate(Aopen_logn_mu, Aopen_logn_sigma)), Aopen_cap_m2)
+
+    dP_Pa = _clip(rng.normalvariate(dP_mean_Pa, dP_sd_Pa), 0.0, 30.0)
+
+    # Effective h at hot face
+    h_rad = _h_radiation(eps_in, T_gas_K)
+    h_in_eff = h_in + h_rad
+
+    # Wall conduction path
+    R_cond = sum(L / (k * A_wall) for (L, k) in layers)
+    R_tot = (1.0 / (h_in_eff * A_wall)) + R_cond + (1.0 / (h_out * A_wall))
+    Qdot_wall_W = max(0.0, (T_gas_K - T_amb_K) / R_tot)
+
+    # Leakage: mass flow + surface exchange at the opening
+    mdot_leak = Cd * A_open * math.sqrt(max(0.0, 2.0 * rho_gas * dP_Pa))
+    Qdot_leak_enthalpy_W = mdot_leak * cp_gas_J_per_kgK * max(0.0, (T_gas_K - T_amb_K))
+    h_open = h_in + _h_radiation(eps_in, T_gas_K)
+    Qdot_leak_surface_W = h_open * A_open * max(0.0, (T_gas_K - T_amb_K))
+
+    Qdot_total_W = Qdot_wall_W + Qdot_leak_enthalpy_W + Qdot_leak_surface_W
+    loss_uncal_MJ = Qdot_total_W * tau_s / 1e6
+
+    # Apply calibration so nominal mean ≈ target_pct of Q_chem
+    loss_MJ = alpha * loss_uncal_MJ
+    loss_pct = loss_MJ / Q_chem_MJ
+
+    return {
+        "loss_MJ": loss_MJ,
+        "loss_pct": loss_pct,
+        "uncal_loss_MJ": loss_uncal_MJ,
+        "alpha_cal": alpha,
+        # samples (for traceability / debugging)
+        "samples_T_gas_K": T_gas_K,
+        "samples_T_amb_K": T_amb_K,
+        "samples_h_in": h_in,
+        "samples_h_out": h_out,
+        "samples_eps_in": eps_in,
+        "samples_A_open_m2": A_open,
+        "samples_dP_Pa": dP_Pa,
+        "samples_Qdot_W": Qdot_total_W,
+    }
+
+# --- Example usage ---
+# Q_chem for 1 hour and call once:
+# result = process_3_1_random(Q_chem_MJ=50000.0, tau_s=3600)
+# print(result["loss_pct"], result["loss_MJ"])
+
+import numpy as np
+
+def radiation_batch(Q_chem_MJ_array, tau_s=3600, *, seed=None, **kwargs):
+    """
+    Vector-friendly wrapper around `radiation(...)`.
+
+    Parameters
+    ----------
+    Q_chem_MJ_array : array-like of float
+        One value per timestep (e.g., 24 hourly values).
+    tau_s : float, default 3600
+        Period length in seconds for each element.
+    seed : int | None
+        If set, makes the whole batch reproducible.
+    **kwargs :
+        Any extra keyword args you want to forward to `radiation(...)`
+        (e.g., tweak means/SDs/caps for a scenario).
+
+    Returns
+    -------
+    dict of numpy arrays with keys:
+      'loss_MJ', 'loss_pct', 'uncal_loss_MJ', 'alpha_cal'
+      plus the sampled inputs for each timestep.
+    """
+    rng = random.Random(seed)
+    q = np.asarray(Q_chem_MJ_array, dtype=float)
+
+    # Run the core function once per element, sharing the same RNG
+    outs = [radiation(float(Q), tau_s, rng=rng, **kwargs) for Q in q]
+
+    # Collate into arrays
+    keys = outs[0].keys()
+    return {k: np.array([o[k] for o in outs]) for k in keys}
+
+# Suppose E_postcombustion is a numpy array (e.g. 24 hourly values)
+res31 = radiation_batch(E_postcombustion, tau_s=3600, seed=42)
+
+# Access arrays of results
+losses = res31["loss_MJ"]
+fractions = res31["loss_pct"]
+
+E_postradiation=E_postcombustion*(1-fractions)
+
+print(E_postradiation)
+
