@@ -1,0 +1,55 @@
+import numpy as np
+from scipy.stats import truncnorm
+
+# -------------------------
+# Residence time distribution
+# -------------------------
+mu_t, sigma_t = 60.0, 10.0   # mean = 60, std = 10
+t_min, t_max  = 30.0, 90.0   # bounds
+a, b = (t_min - mu_t) / sigma_t, (t_max - mu_t) / sigma_t
+
+time_dist = truncnorm(a, b, loc=mu_t, scale=sigma_t)
+
+# -------------------------
+# Efficiency mapping (quadratic fit through anchors)
+# 30 min -> 0.992, 60 min -> 0.995, 90 min -> 0.997
+# -------------------------
+anchors_t  = np.array([30.0, 60.0, 90.0])
+anchors_eta = np.array([0.992, 0.995, 0.997])
+A = np.vstack([anchors_t**2, anchors_t, np.ones_like(anchors_t)]).T
+a2, a1, a0 = np.linalg.solve(A, anchors_eta)
+
+def combustion_efficiency(t_minutes):
+    eta = a2 * t_minutes**2 + a1 * t_minutes + a0
+    return np.clip(eta, 0.0, 1.0)
+
+# -------------------------
+# Simulation for one day
+# -------------------------
+batches_per_day = 96_000
+hours_per_day   = 24
+batches_per_hour = batches_per_day // hours_per_day  # 4000
+
+# Step 1: draw one residence time per hour (24 total)
+hourly_times = time_dist.rvs(size=hours_per_day)
+
+# Step 2: compute efficiency for each hourly time
+hourly_eta = combustion_efficiency(hourly_times)
+
+# Step 3: assign each hourly efficiency to 4000 batches
+batch_eta = np.repeat(hourly_eta, batches_per_hour)
+
+# -------------------------
+# Outputs
+# -------------------------
+print("Hourly residence times (minutes):")
+print(hourly_times)
+print("\nHourly combustion efficiencies:")
+print(hourly_eta)
+print(f"\nArray length of batch efficiencies = {len(batch_eta)} (should be 96,000)")
+print(f"Daily average combustion efficiency = {batch_eta.mean():.5f} ({batch_eta.mean()*100:.3f}%)")
+
+E_postcombustion=(hourly_eta*grouped_energy_MWh)
+
+print("remaining engergies for each batch:")
+print (E_postcombustion)
