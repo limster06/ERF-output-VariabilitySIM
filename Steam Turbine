@@ -1,0 +1,289 @@
+"""
+steam_turbine_stochastic.py
+
+Stochastic turbine efficiency model (no IAPWS). Builds on a simple ideal-gas cp(T)
+model for steam and injects randomised real-world losses.
+
+Units:
+ - Temperature: K
+ - Pressure: Pa
+ - Enthalpy: J/kg
+ - Entropy: J/kg/K
+ - Mass flow: kg/s
+ - Power: W
+
+Dependencies: numpy
+"""
+
+import math
+import numpy as np
+
+# ------------------------------
+# Base thermophysical model (same style as before)
+# ------------------------------
+R_v = 461.5  # J/(kg K) for water vapour (ideal-gas approx)
+T_ref = 273.15
+P_ref = 1.0e5
+
+# Simple cp(T) polynomial coefficients (approx for water vapour)
+_cp_a = 1850.0
+_cp_b = 0.1
+_cp_c = 0.0
+
+def cp_of_T(T):
+    return _cp_a + _cp_b * T + _cp_c * T * T
+
+def h_of_T(T):
+    a, b, c = _cp_a, _cp_b, _cp_c
+    return a * (T - T_ref) + 0.5 * b * (T*T - T_ref*T_ref) + (c/3.0) * (T**3 - T_ref**3)
+
+def s_of_TP(T, P):
+    a, b, c = _cp_a, _cp_b, _cp_c
+    integral_cp_over_T = a * math.log(T / T_ref) + b * (T - T_ref) + 0.5 * c * (T*T - T_ref*T_ref)
+    return integral_cp_over_T - R_v * math.log(P / P_ref)
+
+def find_T2s_by_bisection(s_target, P2, T_low=200.0, T_high=2000.0, tol=1e-6, max_iter=200):
+    s_low = s_of_TP(T_low, P2)
+    s_high = s_of_TP(T_high, P2)
+    if (s_target - s_low) * (s_target - s_high) > 0:
+        # If not bracketed, try expanding
+        T_low_try, T_high_try = 100.0, 5000.0
+        s_low = s_of_TP(T_low_try, P2)
+        s_high = s_of_TP(T_high_try, P2)
+        if (s_target - s_low) * (s_target - s_high) > 0:
+            raise ValueError("Target entropy not bracketed; check inputs.")
+        T_low, T_high = T_low_try, T_high_try
+
+    for _ in range(max_iter):
+        T_mid = 0.5 * (T_low + T_high)
+        s_mid = s_of_TP(T_mid, P2)
+        if abs(s_mid - s_target) < tol:
+            return T_mid
+        if (s_mid - s_target) > 0:
+            T_high = T_mid
+        else:
+            T_low = T_mid
+    return 0.5 * (T_low + T_high)
+
+def ideal_isentropic_results(T1, P1, P2):
+    """
+    Compute ideal results (h1, s1, T2s, h2s, ideal enthalpy drop).
+    """
+    h1 = h_of_T(T1)
+    s1 = s_of_TP(T1, P1)
+    T2s = find_T2s_by_bisection(s1, P2, T_low=200.0, T_high=max(2000.0, T1*1.2))
+    h2s = h_of_T(T2s)
+    delta_h_ideal = h1 - h2s
+    return {
+        'h1': h1,
+        's1': s1,
+        'T2s': T2s,
+        'h2s': h2s,
+        'delta_h_ideal': delta_h_ideal
+    }
+
+# ------------------------------
+# Stochastic loss models and helpers
+# ------------------------------
+def sample_losses(rng=None,
+                  aero_mean=0.25, aero_sd=0.05,
+                  mech_mean=0.15, mech_sd=0.03,
+                  leak_mean=0.02, leak_sd=0.01,
+                  control_mean=0.05, control_sd=0.02,
+                  moisture_mean=0.05, moisture_sd=0.05,
+                  mdot_variation_frac=0.02):
+    """
+    Draw a random sample of loss fractions.
+    Returns a dict with:
+      - aero_loss_frac : fraction of ideal enthalpy drop lost to aerodynamic inefficiencies
+      - mech_loss_frac : fraction of shaft power lost mechanically (bearing/generator)
+      - leak_frac      : fraction of mass flow lost due to leakage (0..0.2)
+      - control_loss_frac: additional fractional loss of power (controls/valves/etc)
+      - moisture_penalty : fraction (0..1) reducing enthalpy extraction efficiency due to wet steam
+      - mdot_frac_noise  : fractional perturbation to mass flow (multiplicative)
+    Notes: all output fractions are clamped to sensible bounds.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Aerodynamic losses: model as fraction of the ideal enthalpy drop that cannot be captured.
+    aero = rng.normal(aero_mean, aero_sd)
+    # Mechanical losses: fraction of shaft power lost (generator + bearings)
+    mech = rng.normal(mech_mean, mech_sd)
+    # Leakage: mass lost before doing work (beta-like behaviour, small)
+    leak = rng.normal(leak_mean, leak_sd)
+    # Control/other: valves, throttling, auxiliary extraction, etc.
+    control = rng.normal(control_mean, control_sd)
+    # Moisture penalty: could be negative (i.e. slightly beneficial) but clamp 0..0.5
+    moisture = rng.normal(moisture_mean, moisture_sd)
+    # Mass flow variation
+    mdot_noise = rng.normal(0.0, mdot_variation_frac)
+
+    # clamp values to realistic ranges
+    aero = float(np.clip(aero, 0.0, 0.4))
+    mech = float(np.clip(mech, 0.0, 0.2))
+    leak = float(np.clip(leak, 0.0, 0.05))
+    control = float(np.clip(control, 0.0, 0.1))
+    moisture = float(np.clip(moisture, -0.1, 0.7))
+    mdot_noise = float(np.clip(mdot_noise, -0.5, 0.5))
+
+    return {
+        'aero_loss_frac': aero,
+        'mech_loss_frac': mech,
+        'leak_frac': leak,
+        'control_loss_frac': control,
+        'moisture_penalty_frac': moisture,
+        'mdot_frac_noise': mdot_noise
+    }
+
+def apply_losses_to_ideal(ideal, losses, mdot_nominal=None, combine_style='enthalpy_fraction'):
+    """
+    Apply sampled losses to an 'ideal' dict from ideal_isentropic_results().
+    combine_style:
+      - 'enthalpy_fraction' (default): treat aero + moisture + control as fractions of the
+         IDEAL enthalpy drop that are irreversibly lost. Mechanical losses apply to shaft power.
+      - 'component_multiplicative': treat aero, mech, control as component efficiencies multiplied.
+    Returns dictionary with:
+      - delta_h_actual (J/kg)
+      - eta_isentropic_actual (dimensionless)  = (h1 - h2_actual) / (h1 - h2s)
+      - eta_shaft (dimensionless) = shaft power / (mdot * delta_h_ideal)
+      - mdot_actual
+      - shaft_power_W (if mdot_nominal provided)
+    """
+    dh_ideal = ideal['delta_h_ideal']
+    if dh_ideal <= 0:
+        raise ValueError("Non-positive ideal enthalpy drop (check inputs); cannot apply losses.")
+
+    aero = losses['aero_loss_frac']
+    mech = losses['mech_loss_frac']
+    leak = losses['leak_frac']
+    control = losses['control_loss_frac']
+    moisture = losses['moisture_penalty_frac']
+    mdot_noise = losses['mdot_frac_noise']
+
+    # nominal mass flow
+    if mdot_nominal is None:
+        mdot_nominal = 1.0  # per-kg basis if not provided
+
+    mdot_actual = mdot_nominal * (1.0 - leak) * (1.0 + mdot_noise)
+
+    if combine_style == 'enthalpy_fraction':
+        # fraction of ideal enthalpy drop lost to irreversible effects
+        # moisture penalty acts like an extra enthalpy loss fraction (if positive)
+        enthalpy_losses_frac = aero + max(0.0, moisture) + control
+        enthalpy_losses_frac = min(enthalpy_losses_frac, 0.95)  # clamp
+        delta_h_actual = dh_ideal * (1.0 - enthalpy_losses_frac)
+        # isentropic efficiency measured as actual enthalpy drop / ideal enthalpy drop
+        eta_isentropic_actual = delta_h_actual / dh_ideal
+        # mechanical losses remove a fraction from shaft power after enthalpy extraction
+        shaft_power = mdot_actual * delta_h_actual * (1.0 - mech)
+        # shaft efficiency relative to ideal turbine available work (mdot_nominal * dh_ideal)
+        eta_shaft = shaft_power / (mdot_nominal * dh_ideal)
+    elif combine_style == 'component_multiplicative':
+        # interpret aero, control as component efficiencies (1 - loss)
+        aero_eff = max(0.0, 1.0 - aero)
+        control_eff = max(0.0, 1.0 - control)
+        moisture_eff = max(0.0, 1.0 - moisture)  # moisture reduces extraction efficiency
+        # multiply component efficiencies to get net thermodynamic extraction efficiency
+        eta_isentropic_actual = aero_eff * control_eff * moisture_eff
+        delta_h_actual = dh_ideal * eta_isentropic_actual
+        shaft_power = mdot_actual * delta_h_actual * (1.0 - mech)
+        eta_shaft = shaft_power / (mdot_nominal * dh_ideal)
+    else:
+        raise ValueError("Unknown combine_style: choose 'enthalpy_fraction' or 'component_multiplicative'")
+
+    # clamp efficiencies
+    eta_isentropic_actual = float(np.clip(eta_isentropic_actual, 0.0, 1.0))
+    eta_shaft = float(np.clip(eta_shaft, 0.0, 1.0))
+    delta_h_actual = float(delta_h_actual)
+    shaft_power = float(shaft_power)
+
+    return {
+        'delta_h_actual': delta_h_actual,
+        'eta_isentropic_actual': eta_isentropic_actual,
+        'eta_shaft': eta_shaft,
+        'mdot_actual': mdot_actual,
+        'shaft_power_W': shaft_power,
+        'losses_used': losses.copy()
+    }
+
+# ------------------------------
+# Monte Carlo driver
+# ------------------------------
+def monte_carlo_runs(T1, P1, P2, mdot_nominal=10.0, nsim=24, rng_seed=None, combine_style='enthalpy_fraction'):
+    """
+    Run Monte Carlo simulations (nsim) and return arrays with results.
+    Returns a dict with numpy arrays:
+      - eta_isentropic_samples
+      - eta_shaft_samples
+      - shaft_power_samples
+      - mdot_samples
+      - losses_list (list of loss dicts for inspection)
+    """
+    if rng_seed is None:
+        rng = np.random.default_rng()
+    else:
+        rng = np.random.default_rng(rng_seed)
+
+    ideal = ideal_isentropic_results(T1, P1, P2)
+    eta_isentropic_samples = np.empty(nsim)
+    eta_shaft_samples = np.empty(nsim)
+    shaft_power_samples = np.empty(nsim)
+    mdot_samples = np.empty(nsim)
+    losses_list = []
+
+    for i in range(nsim):
+        losses = sample_losses(rng=rng)
+        losses_list.append(losses)
+        out = apply_losses_to_ideal(ideal, losses, mdot_nominal=mdot_nominal, combine_style=combine_style)
+        eta_isentropic_samples[i] = out['eta_isentropic_actual']
+        eta_shaft_samples[i] = out['eta_shaft']
+        shaft_power_samples[i] = out['shaft_power_W']
+        mdot_samples[i] = out['mdot_actual']
+
+    return {
+        'eta_isentropic': eta_isentropic_samples,
+        'eta_shaft': eta_shaft_samples,
+        'shaft_power_W': shaft_power_samples,
+        'mdot_actual': mdot_samples,
+        'losses_list': losses_list,
+        'ideal': ideal
+    }
+
+# ------------------------------
+# Simple summary helpers
+# ------------------------------
+def summarise_mc(results):
+    out = {}
+    for k in ['eta_isentropic', 'eta_shaft', 'shaft_power_W', 'mdot_actual']:
+        arr = results[k]
+        out[k] = {
+            'mean': float(np.mean(arr)),
+            'std': float(np.std(arr, ddof=1)),
+            '5%': float(np.percentile(arr, 5)),
+            '50%': float(np.percentile(arr, 50)),
+            '95%': float(np.percentile(arr, 95))
+        }
+    # include ideal eta (isentropic=1.0 by definition here) and ideal delta_h
+    out['ideal_delta_h_J_per_kg'] = float(results['ideal']['delta_h_ideal'])
+    return out
+
+# ------------------------------
+# Example usage (if run as script)
+# ------------------------------
+if __name__ == "__main__":
+    # Example inlet: 10 MPa, 823 K; outlet 10 kPa; nominal mdot=10 kg/s
+    T1 = 673
+    P1 = 7000000
+    P2 = 7000
+    mdot_nom = 20
+
+    print("Running Monte Carlo (24 samples) ...")
+    mc = monte_carlo_runs(T1, P1, P2, mdot_nominal=mdot_nom, nsim=24, rng_seed=42)
+    summary = summarise_mc(mc)
+    import pprint
+    pprint.pprint(summary)
+    # show a few random sample loss draws
+    print("\nExample sample losses (3 draws):")
+    for i in range(3):
+        pprint.pprint(mc['losses_list'][i])
